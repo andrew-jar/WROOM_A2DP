@@ -6,7 +6,7 @@
 
 
 /*
-  WROOM-BT-TX v1.6.4 (ESP32-WROOM-32D) — AUTO SRC 44.1/48k + RESAMPLE + BETTER SCAN + UART EVENTS
+  WROOM-BT-TX v1.6.5 (ESP32-WROOM-32D) — AUTO SRC 44.1/48k + RESAMPLE + BETTER SCAN + UART EVENTS
   Autor: A. Jaroszuk
   -----------------------------------------------------------------------------------
   Co robi:
@@ -19,6 +19,13 @@
   - VOL 0..100 -> 0..127
   - BOOST 100..400 (%), domyślnie 100
 
+
+  Poprawki: (20.07.2026) v1.6.5
+  - RB_DROP: zamiast skip co drugiej ramki, flush do najnowszych danych (mniej chipmunk/fast-forward)
+  - DISCONNECTED: czyszczenie RB i fazy resamplera
+  - RB_FRAMES: 12288 -> 16384 (większy margines na skoki WiFi/S3)
+  - I2S DMA: 8x256 -> 8x512
+  - i2s_read(br==0): nie licz jako twardy ZR, tylko poczekaj 1 ms
 
   Poprawki: (19.07.2026) v1.6.4
   - CONNECT retry: CONNECT_RETRY_MAX = 1 (jedna automatyczna ponowna próba po szybkim DISCONNECTED)
@@ -207,14 +214,14 @@ static volatile uint32_t g_cbUnderrun = 0;
 // - DROP (2): RB overfilled, skip frames (prevent overflow artifacts)
 enum RBState : uint8_t { RB_PREFETCH=0, RB_PROCESS=1, RB_DROP=2 };
 static volatile RBState g_rbState = RB_PREFETCH;
-static const uint32_t RB_PREFETCH_THRESHOLD = 2048;  // transition to PROCESS when > this
-static const uint32_t RB_PROCESS_MIN_THRESHOLD = 1024;  // drop below this -> back to PREFETCH
-static const uint32_t RB_DROP_THRESHOLD = 6000;      // transition to DROP when > this
-static const uint32_t RB_DROP_MIN_THRESHOLD = 4000;  // drop below this -> back to PROCESS
+static const uint32_t RB_PREFETCH_THRESHOLD = 2048;   // transition to PROCESS when > this
+static const uint32_t RB_PROCESS_MIN_THRESHOLD = 1536; // drop below this -> back to PREFETCH
+static const uint32_t RB_DROP_THRESHOLD = 7000;        // transition to DROP when > this
+static const uint32_t RB_DROP_MIN_THRESHOLD = 5000;    // drop below this -> back to PROCESS
 
 // przechowujemy stereo frames: L,R (int16,int16)
 // rozmiar w frames (nie w samplach)
-static const int RB_FRAMES = 12288; // 12288 frames ~ 12288/48k = 256 ms
+static const int RB_FRAMES = 8192; // 8192 frames ~ 8192/48k = 171 ms
 static int16_t rb[RB_FRAMES * 2];  // [L,R,L,R...]
 static volatile uint32_t rb_w = 0; // write index in frames
 static volatile uint32_t rb_r = 0; // read index in frames
@@ -324,6 +331,15 @@ static void rb_drop_frames(uint32_t frames){
   portEXIT_CRITICAL(&rb_mux);
 }
 
+static void rb_keep_recent_frames(uint32_t minFrames){
+  portENTER_CRITICAL(&rb_mux);
+  uint32_t avail = rb_count_frames();
+  if (avail > minFrames) {
+    rb_r = (rb_w + RB_FRAMES - minFrames) % RB_FRAMES;
+  }
+  portEXIT_CRITICAL(&rb_mux);
+}
+
 // ====== Utils ======
 static String bdaToStr(const esp_bd_addr_t bda){
   char s[18];
@@ -404,7 +420,7 @@ static void i2s_init_slave_rx(){
   cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_I2S;
   cfg.dma_buf_count = 8;
-  cfg.dma_buf_len = 256;
+  cfg.dma_buf_len = 512;
   cfg.use_apll = false;
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
 
@@ -556,6 +572,11 @@ static void pcm_task(void *){
       }
     }
 
+    if (!g_a2dpConnected || (g_rbState == RB_PREFETCH && rb_count_frames() > RB_PREFETCH_THRESHOLD * 2)) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      continue;
+    }
+
     rb_push_frames(pcm16, frames);
   }
 }
@@ -669,6 +690,13 @@ static void on_conn_state(esp_a2d_connection_state_t state, void *){
     g_connectInProgress = false;
     g_lastAudioDataMs = millis();
     reset_connect_retry_state();
+    g_cbCalls = 0;
+    rb_clear();
+    g_rbState = RB_PROCESS;
+    g_phase_q16 = 0;
+    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+    delay(100);
+    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
     if (!g_connMac.length() && g_targetMac.length()) {
       g_connMac = g_targetMac;
     }
@@ -681,6 +709,8 @@ static void on_conn_state(esp_a2d_connection_state_t state, void *){
     g_cbSilent = 0;    // Reset silence counter
     g_cbUnderrun = 0;  // Reset underrun counter
     g_rbState = RB_PREFETCH;  // Reset ringbuffer state machine
+    rb_clear();
+    g_phase_q16 = 0;
 
     // Ignore one locally-triggered disconnect used to restart the raw stream before connect.
     if (g_ignoreLocalDisconnectOnce){
@@ -782,10 +812,14 @@ static int32_t get_data(uint8_t *data, int32_t len){
   }
   
   if (g_rbState == RB_DROP){
-    // Drop: skip every 2nd frame to reduce buffer
-    uint32_t skipFrames = outFrames / 2;
-    rb_drop_frames(skipFrames);
-    // now produce output from remaining
+    // Overflow recovery: drop stale history, keep only the freshest audio.
+    portENTER_CRITICAL(&rb_mux);
+    uint32_t avail = rb_count_frames();
+    if (avail > RB_DROP_MIN_THRESHOLD) {
+      rb_r = (rb_w + RB_FRAMES - RB_DROP_MIN_THRESHOLD) % RB_FRAMES;
+    }
+    portEXIT_CRITICAL(&rb_mux);
+    g_rbState = RB_PROCESS;
   }
 
   if (sr == SRC_44100){
@@ -1253,7 +1287,7 @@ void setup(){
   Serial.begin(115200);
   CTRL.begin(UART_BAUD, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
 
-  logLn("READY WROOM-BT-TX v1.6.4 (CB-reset enabled)");
+  logLn("READY WROOM-BT-TX v1.6.5 (CB-reset enabled)");
 
   cfg_load();
 
@@ -1286,13 +1320,7 @@ void loop(){
     }
   }
 
-  if (g_a2dpConnected && g_lastAudioDataMs && (millis() - g_lastAudioDataMs > 1500)) {
-    logLn("AUDIO STALL - restarting media");
-    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
-    delay(100);
-    esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
-    g_lastAudioDataMs = millis();
-  }
+  // v1.6.5c: disable media restart loop here; CONNECTED must not be retriggered by watchdog.
 
   if (readLineFrom(CTRL, bufUart, line)){
     handle_cmd(line, "UART");
