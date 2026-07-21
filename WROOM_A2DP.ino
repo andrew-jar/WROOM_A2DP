@@ -406,11 +406,15 @@ static bool on_ssid_found(const char* ssid, esp_bd_addr_t address, int rssi){
     scanStore(address, rssi, name);
     int idx = scanFindByMac(mac);
     if (idx >= 0 && idx >= prevCount){
-      logF("DEV %d %s RSSI=%d NAME=\"%s\"\n", idx, mac.c_str(), rssi, name.c_str());
+      logF("DEV %d %s RSSI=%d NAME=\"%s\"\n", idx, mac.c_str(), rssi, g_scan[idx].name.c_str());
     }
   }
 
   if (g_targetMac.length() && mac.equalsIgnoreCase(g_targetMac)){
+    int idx = scanFindByMac(mac);
+    if (idx >= 0 && name.length()) {
+      g_scan[idx].name = name;
+    }
     g_connMac = mac;
     if (name.length()) g_connName = name;
     logF("EVT SCAN MATCH MAC=%s NAME=\"%s\"\n", mac.c_str(), g_connName.c_str());
