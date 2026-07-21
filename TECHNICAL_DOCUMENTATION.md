@@ -10,7 +10,7 @@ Target board:
 - ESP32-WROOM-32D
 
 Firmware banner:
-- READY WROOM-BT-TX v1.6.4 (CB-reset enabled)
+- READY WROOM-BT-TX v1.6.5 (CB-reset enabled)
 
 Main role:
 - Receive PCM from I2S slave input
@@ -37,7 +37,7 @@ I2S (input from host):
 4. Samples are pushed to an internal ring buffer (8192 frames).
 5. A2DP callback pulls audio:
 - 44.1 kHz source: passthrough
-- 48 kHz source: linear interpolation resampling 48k -> 44.1k
+- 48 kHz source: resampling 48k -> 44.1k (linear interpolation, optional HQ filter)
 
 ## 4. Ring Buffer and State Machine
 Ring buffer size:
@@ -46,21 +46,26 @@ Ring buffer size:
 States:
 - PREFETCH: callback returns silence while buffer is filling
 - PROCESS: normal streaming from ring buffer
-- DROP: drops part of buffered frames to reduce overfill pressure
+- DROP: trims stale history and keeps the freshest audio window
 
 Thresholds:
 - RB_PREFETCH_THRESHOLD = 2048
-- RB_PROCESS_MIN_THRESHOLD = 1024
-- RB_DROP_THRESHOLD = 6000
-- RB_DROP_MIN_THRESHOLD = 4000
+- RB_PROCESS_MIN_THRESHOLD = 1536
+- RB_DROP_THRESHOLD = 7000
+- RB_DROP_MIN_THRESHOLD = 5000
 
 Current behavior:
 - Start in PREFETCH
 - Transition to PROCESS after fill threshold
-- Enter DROP when too full, return to PROCESS when reduced
+- Enter DROP when too full, flush stale data, then return to PROCESS
 
 ## 5. Bluetooth and Session Behavior
 Connection events are handled in on_conn_state().
+
+On CONNECTED:
+- callback counters are reset,
+- ring buffer and resampler phase are reset,
+- A2DP media path is started via CHECK_SRC_RDY + START.
 
 On DISCONNECTED:
 - A2DP connection flag is cleared
@@ -69,6 +74,10 @@ On DISCONNECTED:
   - CBS (silent callback count)
   - CBU (underrun callback count)
 - Ringbuffer state resets to PREFETCH
+- Single quick reconnect retry is available (CONNECT_RETRY_MAX = 1)
+
+When MODE OFF is active:
+- Connection callback activity is ignored to suppress late BT events.
 
 This allows per-session diagnostics after reconnect.
 
@@ -125,7 +134,14 @@ A periodic task classifies source rate:
 
 The mode switch uses stability windows to avoid flapping.
 
-## 9. Persistence
+## 9. Scan and Connect Flow
+- Scan uses GAP inquiry (about 12.8 s window).
+- Before CONNECT after an active scan cancellation, a short guard delay is used:
+  CONNECT_POST_SCAN_DELAY_MS = 350.
+- On scan timeout, discovery is explicitly canceled.
+- A single auto-retry CONNECT is used after quick disconnect.
+
+## 10. Persistence
 NVS namespace: btcfg
 Stored values:
 - mode
@@ -135,7 +151,13 @@ Stored values:
 
 SAVE command commits current configuration.
 
-## 10. Integration Notes (S3 Side)
+## 11. BT Range and Power
+After A2DP starts, BR/EDR TX power is set to maximum:
+- esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9)
+
+This can improve edge-of-range stability but does not bypass hardware/RF limits.
+
+## 12. Integration Notes (S3 Side)
 The paired S3 bridge (btbridge.cpp) is expected to:
 - Send STATUS? periodically
 - Parse READY and STATE lines
@@ -145,7 +167,7 @@ Applied timeout profile on S3 side:
 - TX lock timeout: 200 ms
 - RX lock timeout in loop: 10 ms
 
-## 11. Build and Flash
+## 13. Build and Flash
 Firmware is maintained as Arduino .ino project.
 Typical workflow:
 1. Open WROOM_A2DP.ino in Arduino IDE.
@@ -153,16 +175,18 @@ Typical workflow:
 3. Upload to WROOM module.
 4. Validate with serial monitor at 115200.
 
-## 12. Post-Flash Validation Checklist
-1. Boot banner shows v1.6.1 and CB-reset note.
+## 14. Post-Flash Validation Checklist
+1. Boot banner shows v1.6.5 and CB-reset note.
 2. STATUS line includes RB state suffix [PREFETCH|PROCESS|DROP].
 3. During active playback: I2S_ERR=0 and CBU=0.
 4. After disconnect/reconnect: CB restarts from 0.
 5. SCAN and CONNECT still work with expected EVT lines.
+6. Startup log includes OK BT TX POWER P9.
 
-## 13. Known Good Log Pattern
+## 15. Known Good Log Pattern
 Expected sequence after reconnect:
-- STATE ... RB=8191[PREFETCH] ... CB=0
+- STATE ... RB=0[PREFETCH] ... CB=0
+- EVT A2DP_CONN CONNECTED ...
 - EVT A2DP_AUDIO STARTED ...
 - STATE ... RB=xxxx[PROCESS] ... CB grows from 0
 
