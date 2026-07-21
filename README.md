@@ -1,3 +1,8 @@
+
+
+<img width="650" height="405" alt="2026-07-21_174244" src="https://github.com/user-attachments/assets/bcaa48a4-4db7-4c65-9e27-35e031aa70bd" />
+
+
 WROOM-BT-TX Dokumentacja Techniczna (PL)
 
 Autor: A. Jaroszuk
