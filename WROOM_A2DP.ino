@@ -58,6 +58,7 @@ extern "C" {
   #include "nvs_flash.h"
   #include "nvs.h"
   #include "driver/i2s.h"
+  #include "esp_bt.h"
   #include "esp_gap_bt_api.h"
   #include "esp_bt_main.h"
   #include "esp_bt_device.h"
@@ -177,6 +178,15 @@ static inline int16_t sampleFromHigh16(int32_t sample32){
   if (v > 32767) v = 32767;
   if (v < -32768) v = -32768;
   return (int16_t)v;
+}
+
+static void setBtTxPowerMax(){
+  esp_err_t err = esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9);
+  if (err == ESP_OK){
+    logLn("OK BT TX POWER P9");
+  } else {
+    logF("ERR BT TX POWER %d\n", (int)err);
+  }
 }
 
 static bool start_gap_scan(){
@@ -674,6 +684,10 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param){
 
 // ===== A2DP eventy =====
 static void on_conn_state(esp_a2d_connection_state_t state, void *){
+  if (g_mode == MODE_OFF){
+    return;
+  }
+
   const char* s =
     (state==ESP_A2D_CONNECTION_STATE_DISCONNECTED) ? "DISCONNECTED" :
     (state==ESP_A2D_CONNECTION_STATE_CONNECTING)   ? "CONNECTING" :
@@ -944,6 +958,7 @@ static void ensureBtStarted(){
 
   a2dp.start_raw(get_data);
   a2dp.set_volume(g_vol_127);
+  setBtTxPowerMax();
 
   rb_clear();
   g_srcRate = SRC_UNKNOWN;
@@ -1031,6 +1046,7 @@ static void scan_start(){
   if (g_scanning){
     esp_bt_gap_cancel_discovery();
     g_scanning = false;
+    vTaskDelay(pdMS_TO_TICKS(CONNECT_POST_SCAN_DELAY_MS));
   }
 
   scanClear();
@@ -1315,6 +1331,7 @@ void loop(){
     const uint32_t scanAgeMs = millis() - g_scanStartedMs;
 
     if (scanAgeMs >= SCAN_WINDOW_MS){
+      esp_bt_gap_cancel_discovery();
       g_scanning = false;
       logF("SCAN DONE COUNT=%d\n", g_scanCount);
     }
