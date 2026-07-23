@@ -6,7 +6,7 @@
 
 
 /*
-  WROOM-BT-TX v1.6.6 (ESP32-WROOM-32D) — AUTO SRC 44.1/48k + RESAMPLE + BETTER SCAN + UART EVENTS
+  WROOM-BT-TX v1.6.5 (ESP32-WROOM-32D) — AUTO SRC 44.1/48k + RESAMPLE + BETTER SCAN + UART EVENTS
   Autor: A. Jaroszuk
   -----------------------------------------------------------------------------------
   Co robi:
@@ -19,12 +19,6 @@
   - VOL 0..100 -> 0..127
   - BOOST 100..400 (%), domyślnie 100
 
-
-  Poprawki: (22.07.2026) v1.6.6
-  - GAP DISCOVERY_STARTED: scanClear() dla czystej listy po każdym SCAN
-  - GAP DISC_RES: ignorowanie wyników gdy już po CONNECT oraz poza aktywnym SCAN
-  - GAP DISC_RES: nie aktualizuj nazwy pustym EIR; aktualizuj tylko RSSI
-  - Nowa komenda: SCAN STOP (cancel discovery przed CONNECT)
 
   Poprawki: (20.07.2026) v1.6.5
   - RB_DROP: zamiast skip co drugiej ramki, flush do najnowszych danych (mniej chipmunk/fast-forward)
@@ -375,13 +369,7 @@ static bool parseMac(const String& mac, esp_bd_addr_t out){
 }
 
 static void scanClear(){
-  // Keep String objects valid while force-resetting cached scan data.
-  for (auto &d: g_scan){
-    memset(d.bda, 0, sizeof(d.bda));
-    d.rssi = 0;
-    d.name = "";
-    d.valid = false;
-  }
+  for (auto &d: g_scan) d = Dev();
   g_scanCount = 0;
 }
 
@@ -397,11 +385,7 @@ static void scanStore(const esp_bd_addr_t bda, int rssi, const String& name){
   for(int i=0;i<g_scanCount;i++){
     if (g_scan[i].valid && memcmp(g_scan[i].bda, bda, 6) == 0){
       g_scan[i].rssi = rssi;
-      if (name.length() && name != "Android TV" && g_scan[i].name.startsWith("JBL")) {
-        // Do not overwrite known JBL label with generic Android TV advert name.
-      } else if (name.length()) {
-        g_scan[i].name = name;
-      }
+      if (name.length()) g_scan[i].name = name;
       return;
     }
   }
@@ -422,15 +406,11 @@ static bool on_ssid_found(const char* ssid, esp_bd_addr_t address, int rssi){
     scanStore(address, rssi, name);
     int idx = scanFindByMac(mac);
     if (idx >= 0 && idx >= prevCount){
-      logF("DEV %d %s RSSI=%d NAME=\"%s\"\n", idx, mac.c_str(), rssi, g_scan[idx].name.c_str());
+      logF("DEV %d %s RSSI=%d NAME=\"%s\"\n", idx, mac.c_str(), rssi, name.c_str());
     }
   }
 
   if (g_targetMac.length() && mac.equalsIgnoreCase(g_targetMac)){
-    int idx = scanFindByMac(mac);
-    if (idx >= 0 && name.length()) {
-      g_scan[idx].name = name;
-    }
     g_connMac = mac;
     if (name.length()) g_connName = name;
     logF("EVT SCAN MATCH MAC=%s NAME=\"%s\"\n", mac.c_str(), g_connName.c_str());
@@ -632,7 +612,6 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param){
   switch(event){
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {
       if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED){
-        scanClear();
         g_scanning = true;
         logLn("SCAN START");
       } else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED){
@@ -642,9 +621,6 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param){
     } break;
 
     case ESP_BT_GAP_DISC_RES_EVT: {
-      if (g_a2dpConnected) break;
-      if (!g_scanning) break;
-
       int rssi = 0;
       String name = "";
 
@@ -653,16 +629,8 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param){
         if (p.type == ESP_BT_GAP_DEV_PROP_RSSI){
           rssi = *(int8_t*)p.val;
         } else if (p.type == ESP_BT_GAP_DEV_PROP_EIR){
-          String n = eirToName((uint8_t*)p.val);
-          if (n.length()) name = n;
+          name = eirToName((uint8_t*)p.val);
         }
-      }
-
-      if (name.length() == 0) {
-        String mac = bdaToStr(param->disc_res.bda);
-        int idx = scanFindByMac(mac);
-        if (idx >= 0) g_scan[idx].rssi = rssi;
-        break;
       }
 
       scanStore(param->disc_res.bda, rssi, name);
@@ -1090,17 +1058,6 @@ static void scan_start(){
   start_gap_scan();
 }
 
-static void scan_stop(){
-  if (!g_scanning) {
-    logLn("OK SCAN STOP");
-    return;
-  }
-
-  esp_bt_gap_cancel_discovery();
-  g_scanning = false;
-  logLn("OK SCAN STOP");
-}
-
 static void connect_mac(const String& mac){
 
   if (g_mode == MODE_OFF){
@@ -1243,7 +1200,7 @@ static void delpaired_all_async(){
 
 // ===== cmd parser =====
 static void help_print(){
-  logLn("CMDS: HELP, PING, GET, STATUS?, BT ON, BT OFF, MODE OFF|TX (AUTO=legacy), VOL 0..100, BOOST 100..400, SCAN, SCAN STOP, CONNECT <idx|MAC>, DISCONNECT, PAIRED?, DELPAIRED ALL, SAVE, DBG 0|1, HARDRESET");
+  logLn("CMDS: HELP, PING, GET, STATUS?, BT ON, BT OFF, MODE OFF|TX (AUTO=legacy), VOL 0..100, BOOST 100..400, SCAN, CONNECT <idx|MAC>, DISCONNECT, PAIRED?, DELPAIRED ALL, SAVE, DBG 0|1, HARDRESET");
 }
 
 static void handle_cmd(String s, const char* src){
@@ -1300,7 +1257,6 @@ static void handle_cmd(String s, const char* src){
   }
 
   if (u=="SCAN"){ scan_start(); return; }
-  if (u=="SCAN STOP"){ scan_stop(); return; }
 
   if (u.startsWith("CONNECT ")){
     String a = s.substring(8); a.trim();
@@ -1347,7 +1303,7 @@ void setup(){
   Serial.begin(115200);
   CTRL.begin(UART_BAUD, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
 
-  logLn("READY WROOM-BT-TX v1.6.6 (CB-reset enabled)");
+  logLn("READY WROOM-BT-TX v1.6.5 (CB-reset enabled)");
 
   cfg_load();
 
