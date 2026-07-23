@@ -159,7 +159,7 @@ static int g_scanCount = 0;
 static uint32_t g_scanStartedMs = 0;
 static String g_targetMac = "";
 static const uint32_t SCAN_WINDOW_MS = 12000;
-static const uint8_t CONNECT_RETRY_MAX = 1;
+static const uint8_t CONNECT_RETRY_MAX = 0;
 static const uint32_t CONNECT_RETRY_DELAY_MS = 1400;
 static const uint32_t CONNECT_POST_SCAN_DELAY_MS = 350;
 
@@ -1076,7 +1076,14 @@ static void connect_mac(const String& mac){
   g_connMac = mac;
   g_targetMac = mac;
   g_connectInProgress = true;
-  g_scanning = false;
+
+  // Do not start A2DP connect while inquiry is still active.
+  if (g_scanning){
+    esp_bt_gap_cancel_discovery();
+    g_scanning = false;
+    logLn("SCAN STOP (AUTO BEFORE CONNECT)");
+    vTaskDelay(pdMS_TO_TICKS(CONNECT_POST_SCAN_DELAY_MS));
+  }
 
   // If already connected to another device, drop the old link once before switching.
   if (g_a2dpConnected){
