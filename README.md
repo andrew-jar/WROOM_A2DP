@@ -46,6 +46,7 @@ Więcej....https://github.com/andrew-jar/WROOM_A2DP/blob/main/DOKUMENTACJA_TECHN
 
 ## Aktualizacja 2026-08-01
 
+- Podniesiono wydanie firmware w pliku WROOM_A2DP.ino z v1.6.5 do v1.7.0.
 - Zsynchronizowano projekt z nowsza lokalna wersja firmware.
 - Zaktualizowano obsluge Bluetooth A2DP pod nowsze API (linia zmian 1.7.5 -> 1.8.11, Core 3.x).
 - Ulepszono logike polaczen BT: obsluge stanow, reconnect/retry oraz diagnostyke zdarzen.
