@@ -43,3 +43,11 @@ I2S (wejscie z hosta):
     Format wejscia: stereo 32-bit, konwersja do 16-bit PCM wewnetrznie
 
 Więcej....https://github.com/andrew-jar/WROOM_A2DP/blob/main/DOKUMENTACJA_TECHNICZNA_PL.md#wroom-bt-tx-dokumentacja-techniczna-pl
+
+## Aktualizacja 2026-08-01
+
+- Zsynchronizowano projekt z nowsza lokalna wersja firmware.
+- Zaktualizowano obsluge Bluetooth A2DP pod nowsze API (linia zmian 1.7.5 -> 1.8.11, Core 3.x).
+- Ulepszono logike polaczen BT: obsluge stanow, reconnect/retry oraz diagnostyke zdarzen.
+- Rozszerzono logowanie statusu pracy (m.in. stan zrodla audio, ring buffer, telemetria I2S/callbackow).
+- Wprowadzono poprawki stabilnosci strumieniowania audio.
