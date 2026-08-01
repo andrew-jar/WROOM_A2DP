@@ -34,7 +34,7 @@ Kroki praktyczne:
 1) Otworz terminal w folderze release.
 2) Uruchom komende pelnego wgrania (podmien COM5 na swoj port).
 3) Jesli flash nie startuje, wprowadz plytke w tryb boot (BOOT przy reset).
-4) Po flashu otworz monitor portu 115200 i sprawdz napis READY WROOM-BT-TX v1.6.2 (CB-reset enabled)
+4) Po flashu otworz monitor portu 115200 i sprawdz napis READY WROOM-BT-TX v1.7.0 (CB-reset enabled)
 
 Uwagi:
 - Jesli inny modul ESP32, najlepiej zostac przy pelnym wgraniu trzema plikami.

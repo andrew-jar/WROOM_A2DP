@@ -35,7 +35,7 @@ Practical steps:
 1) Open a terminal in the release folder.
 2) Run the full flash command (replace COM5 with your port).
 3) If flashing does not start, put the board into boot mode (BOOT while resetting).
-4) After flashing, open the serial monitor at 115200 baud and check for: READY WROOM-BT-TX v1.6.2 (CB-reset enabled)
+4) After flashing, open the serial monitor at 115200 baud and check for: READY WROOM-BT-TX v1.7.0 (CB-reset enabled)
 
 Notes:
 - If you use a different ESP32 module, the safest option is still a full flash with all three files.
