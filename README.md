@@ -18,7 +18,7 @@ Plytka docelowa:
 
 Banner firmware:
 
-    READY WROOM-BT-TX v1.6.5 (CB-reset enabled)
+    READY WROOM-BT-TX v1.7.0 (CB-reset enabled)
 
 Glowna rola modulu:
 

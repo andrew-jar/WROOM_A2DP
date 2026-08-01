@@ -10,7 +10,7 @@ Target board:
 - ESP32-WROOM-32D
 
 Firmware banner:
-- READY WROOM-BT-TX v1.6.5 (CB-reset enabled)
+- READY WROOM-BT-TX v1.7.0 (CB-reset enabled)
 
 Main role:
 - Receive PCM from I2S slave input
@@ -176,7 +176,7 @@ Typical workflow:
 4. Validate with serial monitor at 115200.
 
 ## 14. Post-Flash Validation Checklist
-1. Boot banner shows v1.6.5 and CB-reset note.
+1. Boot banner shows v1.7.0 and CB-reset note.
 2. STATUS line includes RB state suffix [PREFETCH|PROCESS|DROP].
 3. During active playback: I2S_ERR=0 and CBU=0.
 4. After disconnect/reconnect: CB restarts from 0.

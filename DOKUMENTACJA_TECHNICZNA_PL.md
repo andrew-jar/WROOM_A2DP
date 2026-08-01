@@ -10,7 +10,7 @@ Plytka docelowa:
 - ESP32-WROOM-32D
 
 Banner firmware:
-- READY WROOM-BT-TX v1.6.5 (CB-reset enabled)
+- READY WROOM-BT-TX v1.7.0 (CB-reset enabled)
 
 Glowna rola modulu:
 - Odbior PCM z I2S (slave RX)
@@ -175,7 +175,7 @@ Zalecany workflow:
 4. Walidacja przez monitor szeregowy 115200.
 
 ## 14. Checklista po flashu
-1. Banner startowy pokazuje v1.6.5 i dopisek CB-reset.
+1. Banner startowy pokazuje v1.7.0 i dopisek CB-reset.
 2. STATE zawiera RB z sufiksem stanu [PREFETCH|PROCESS|DROP].
 3. Podczas odtwarzania: I2S_ERR=0 i CBU=0.
 4. Po disconnect/reconnect: CB startuje od 0.
