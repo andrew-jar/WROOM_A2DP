@@ -1,4 +1,19 @@
+# VTom Radio - Bluetooth Bridge Panel
 
+Panel sterowania modułem **WROOM A2DP** dla radia **VTom Radio**.
+
+Współpracuje z: https://github.com/andrew-jar/WROOM_A2DP
+
+### Co to jest?
+
+Webowy panel UART/Bridge do zarządzania Bluetooth Audio w trybie TX:
+- `BT ON/OFF`, `MODE TX`, `SCAN`, `CONNECT`, `DISCONNECT`
+- `VOL` (0-85) + `BOOST` (80-200) - bez przesteru CSR
+- `SAVE`, `PAIRED?`, `DELPAIRED ALL`, `HARDRESET`
+- Live log z filtrowaniem `STATE` / `STATUS?`
+- Lista `Detected Devices` - dedup po MAC, sort po ID
+
+------------------------------------------------------
 
 <img width="650" height="405" alt="2026-07-21_174244" src="https://github.com/user-attachments/assets/bcaa48a4-4db7-4c65-9e27-35e031aa70bd" />
 
