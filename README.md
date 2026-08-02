@@ -1,17 +1,18 @@
-# VTom Radio - Bluetooth Bridge Panel
+# Firmware dla modułu **ESP32-WROOM-32D** jako most Bluetooth Audio TX.
+(Bluetooth Audio Transmitter for VTom Radio)
 
-Panel sterowania modułem **WROOM A2DP** dla radia **VTom Radio**.
+Stworzony specjalnie dla radia internetowego **VTom Radio** 
+- odbiera dźwięk po I2S i wysyła go na słuchawki / głośniki Bluetooth.
 
-Współpracuje z: https://github.com/andrew-jar/WROOM_A2DP
+Współpracuje z: https://github.com/andrew-jar/VTomRadio_BT
 
-### Co to jest?
+### Co potrafi
 
-Webowy panel UART/Bridge do zarządzania Bluetooth Audio w trybie TX:
-- `BT ON/OFF`, `MODE TX`, `SCAN`, `CONNECT`, `DISCONNECT`
-- `VOL` (0-85) + `BOOST` (80-200) - bez przesteru CSR
-- `SAVE`, `PAIRED?`, `DELPAIRED ALL`, `HARDRESET`
-- Live log z filtrowaniem `STATE` / `STATUS?`
-- Lista `Detected Devices` - dedup po MAC, sort po ID
+* Odbiera czysty PCM po **I2S Slave** - 32-bit stereo -> 16-bit wewnętrznie
+* Automatycznie wykrywa źródło **44.1 kHz / 48 kHz** i robi resampling do `OUT 44100`
+* Nadaje jako **Bluetooth A2DP Source** - tryb TX
+* Pełny monitoring: `RB`, `I2S_OK/ERR`, `CB/CBU`, `SRC`, `VOL/BOOST`
+* Stabilny reconnect, obsługa zdarzeń `EVT A2DP_CONN CONNECTED/DISCONNECTED`
 
 ------------------------------------------------------
 
