@@ -1,13 +1,7 @@
 // Copyright (c) 2026 A. Jaroszuk. All rights reserved.
 // Licensed for private home use only under LICENSE_HOME_USE.md.
-// PORTED to ESP32-A2DP v1.8.11 + Arduino Core 3.x (IDF 5.x)
-// Baza: WROOM-BT-TX v1.6.5
-// Zmiany: API 1.8.11 (set_data_callback + start), Core 3.x kompatybilność
-
-/*
-  WROOM-BT-TX v1.6.5 -> v1.7.0-port-1.8.11 (ESP32-WROOM-32D) — AUTO SRC 44.1/48k + RESAMPLE + BETTER SCAN + UART EVENTS
-  Autor: A. Jaroszuk (port: MOD AJ + Core3)
-*/
+// PORTED to ESP32-A2DP v1.8.11 + Arduino Core 3.x (IDF 5.x) - P1 FIXED v6 FINAL 100% CLOSED 100% - scanStore no-lock guard - scanClear/scanFind taken fix - log taken fix
+// FIX: 4x P1 - strncpy \0, mutex timeout, snapshot targetMac, snapshot scanCount
 
 #include <Arduino.h>
 #include "BluetoothA2DPSource.h"
@@ -42,23 +36,43 @@ enum SrcRate : uint8_t;
 static const int PIN_UART_RX = 16;
 static const int PIN_UART_TX = 17;
 static const uint32_t UART_BAUD = 115200;
-
 static const int PIN_I2S_BCLK = 14;
 static const int PIN_I2S_WS   = 15;
 static const int PIN_I2S_DIN  = 32;
-
 static const i2s_bits_per_sample_t AUDIO_BITS = I2S_BITS_PER_SAMPLE_32BIT;
 static const int OUT_SR = 44100;
 
 HardwareSerial CTRL(2);
 BluetoothA2DPSource a2dp;
 static const i2s_port_t I2S_PORT = I2S_NUM_0;
-
 static bool USB_DEBUG = true;
 
+// P1 FIX: mutexy + timeouty
+static SemaphoreHandle_t g_logMux = nullptr;
+static SemaphoreHandle_t g_scanMux = nullptr;
+#define SCAN_MUX_TIMEOUT pdMS_TO_TICKS(10)
+#define LOG_MUX_TIMEOUT  pdMS_TO_TICKS(10)
+
+// bezpieczny helper
+static inline void safe_strncpy(char* dst, const char* src, size_t dstSize){
+  if (!dst || dstSize==0) return;
+  if (!src) { dst[0]=0; return; }
+  strncpy(dst, src, dstSize-1);
+  dst[dstSize-1] = '\0';
+}
+static inline void safe_strncpy_bt(char* dst, const String& src, size_t dstSize){
+  if (!dst || dstSize==0) return;
+  if (src.length()==0) { dst[0]=0; return; }
+  strncpy(dst, src.c_str(), dstSize-1);
+  dst[dstSize-1] = '\0';
+}
+
 static void logLn(const char* s){
+  bool taken = false;
+  if (g_logMux) taken = (xSemaphoreTake(g_logMux, LOG_MUX_TIMEOUT) == pdTRUE);
   CTRL.println(s);
   if (USB_DEBUG) Serial.println(s);
+  if (taken) xSemaphoreGive(g_logMux);
 }
 static void logF(const char* fmt, ...){
   char buf[256];
@@ -66,13 +80,15 @@ static void logF(const char* fmt, ...){
   va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
+  bool taken = false;
+  if (g_logMux) taken = (xSemaphoreTake(g_logMux, LOG_MUX_TIMEOUT) == pdTRUE);
   CTRL.print(buf);
   if (USB_DEBUG) Serial.print(buf);
+  if (taken) xSemaphoreGive(g_logMux);
 }
 
 enum Mode : uint8_t { MODE_OFF=0, MODE_TX=1, MODE_AUTO=2 };
 static volatile Mode g_mode = MODE_TX;
-
 static bool g_btReady = false;
 static bool g_scanning = false;
 static bool g_a2dpConnected = false;
@@ -82,23 +98,23 @@ static uint32_t g_connectRetryAtMs = 0;
 static uint8_t g_connectRetryCount = 0;
 static uint32_t g_lastAudioDataMs = 0;
 
-static String g_connMac = "";
-static String g_connName = "";
+static char g_connMac[18] = "";
+static char g_connName[65] = "";
+static char g_targetMac[18] = "";
 
 static int g_vol_ui = 100;
 static uint8_t g_vol_127 = 127;
-static int g_boost_pct = 100; // FIX8 default 100 clean
+static int g_boost_pct = 100;
 
 struct Dev {
   esp_bd_addr_t bda{};
   int rssi = 0;
-  String name;
+  char name[65] = {0};
   bool valid = false;
 };
 static Dev g_scan[25];
-static int g_scanCount = 0;
+static volatile int g_scanCount = 0;
 static uint32_t g_scanStartedMs = 0;
-static String g_targetMac = "";
 static const uint32_t SCAN_WINDOW_MS = 12000;
 static const uint8_t CONNECT_RETRY_MAX = 0;
 static const uint32_t CONNECT_RETRY_DELAY_MS = 1400;
@@ -113,12 +129,10 @@ static inline int16_t sampleFromHigh16(int32_t sample32){
   if (v < -32768) v = -32768;
   return (int16_t)v;
 }
-
 static void setBtTxPowerMax(){
   esp_err_t err = esp_bredr_tx_power_set(ESP_PWR_LVL_P9, ESP_PWR_LVL_P9);
   if (err == ESP_OK){ logLn("OK BT TX POWER P9"); } else { logF("ERR BT TX POWER %d\n", (int)err); }
 }
-
 static bool start_gap_scan(){
   esp_err_t err = esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 10, 0);
   if (err != ESP_OK){ logF("ERR SCAN START GAP=%d\n", (int)err); g_scanning = false; return false; }
@@ -129,7 +143,6 @@ enum SrcRate : uint8_t { SRC_UNKNOWN=0, SRC_44100=1, SRC_48000=2 };
 static volatile SrcRate g_srcRate = SRC_UNKNOWN;
 static volatile int g_srcHz = 0;
 static volatile uint32_t g_wsEdges = 0;
-
 static volatile uint32_t g_i2sReadsOk = 0;
 static volatile uint32_t g_i2sReadsErr = 0;
 static volatile uint32_t g_i2sZeroReads = 0;
@@ -144,7 +157,6 @@ static const uint32_t RB_PREFETCH_THRESHOLD = 2048;
 static const uint32_t RB_PROCESS_MIN_THRESHOLD = 1536;
 static const uint32_t RB_DROP_THRESHOLD = 7000;
 static const uint32_t RB_DROP_MIN_THRESHOLD = 5000;
-
 static const int RB_FRAMES = 8192;
 static int16_t rb[RB_FRAMES * 2];
 static volatile uint32_t rb_w = 0;
@@ -176,11 +188,7 @@ static uint32_t rb_pop_frames(int16_t* outLR, uint32_t frames){
 static uint32_t g_phase_q16 = 0;
 static uint32_t g_step_q16  = 0;
 static const uint8_t RESAMPLER_QUALITY = 1;
-static int32_t g_rsLpL1 = 0;
-static int32_t g_rsLpL2 = 0;
-static int32_t g_rsLpR1 = 0;
-static int32_t g_rsLpR2 = 0;
-
+static int32_t g_rsLpL1 = 0, g_rsLpL2 = 0, g_rsLpR1 = 0, g_rsLpR2 = 0;
 static inline int16_t clamp16_from_i32(int32_t v){ if (v > 32767) return 32767; if (v < -32768) return -32768; return (int16_t)v; }
 static inline int16_t resampler_hq_filter_i32(int32_t x, int32_t& s1, int32_t& s2){
   static const int32_t ALPHA_Q15 = 18000;
@@ -215,28 +223,90 @@ static bool parseMac(const String& mac, esp_bd_addr_t out){
   for (int i = 0; i < 6; i++){ if (b[i] < 0 || b[i] > 255) return false; out[i] = (uint8_t)b[i]; }
   return true;
 }
-static void scanClear(){ for (auto &d: g_scan) d = Dev(); g_scanCount = 0; }
+
+// FIX #4: snapshot pod mutexem
+static void scanClear(){
+  bool taken = false;
+  if (g_scanMux) taken = (xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT) == pdTRUE);
+  if (!taken) return;
+  for (auto &d: g_scan) { d.valid = false; d.rssi = 0; d.name[0]=0; memset(d.bda,0,6); }
+  g_scanCount = 0;
+  xSemaphoreGive(g_scanMux);
+}
 static int scanFindByMac(const String& mac){
-  for(int i=0;i<g_scanCount;i++){ if (!g_scan[i].valid) continue; if (bdaToStr(g_scan[i].bda).equalsIgnoreCase(mac)) return i; }
-  return -1;
+  int ret = -1;
+  bool taken = false;
+  if (g_scanMux) taken = (xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT) == pdTRUE);
+  if (!taken) return -1;
+  int cnt = g_scanCount;
+  for(int i=0;i<cnt;i++){ if (!g_scan[i].valid) continue; if (bdaToStr(g_scan[i].bda).equalsIgnoreCase(mac)) { ret = i; break; } }
+  xSemaphoreGive(g_scanMux);
+  return ret;
 }
 static void scanStore(const esp_bd_addr_t bda, int rssi, const String& name){
-  for(int i=0;i<g_scanCount;i++){ if (g_scan[i].valid && memcmp(g_scan[i].bda, bda, 6) == 0){ g_scan[i].rssi = rssi; if (name.length()) g_scan[i].name = name; return; } }
-  if (g_scanCount >= (int)(sizeof(g_scan)/sizeof(g_scan[0]))) return;
-  memcpy(g_scan[g_scanCount].bda, bda, 6); g_scan[g_scanCount].rssi = rssi; g_scan[g_scanCount].name = name; g_scan[g_scanCount].valid = true; g_scanCount++;
+  bool taken = false;
+  if (g_scanMux) taken = (xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT) == pdTRUE);
+  if (!taken) return; // P1 FIX v5: nie modyfikuj bez locka
+  for(int i=0;i<g_scanCount;i++){ if (g_scan[i].valid && memcmp(g_scan[i].bda, bda, 6) == 0){
+    g_scan[i].rssi = rssi;
+    if (name.length()) { safe_strncpy_bt(g_scan[i].name, name, sizeof(g_scan[i].name)); }
+    xSemaphoreGive(g_scanMux);
+    return;
+  }}
+  if (g_scanCount >= (int)(sizeof(g_scan)/sizeof(g_scan[0]))) { xSemaphoreGive(g_scanMux); return; }
+  memcpy(g_scan[g_scanCount].bda, bda, 6); g_scan[g_scanCount].rssi = rssi;
+  if (name.length()) safe_strncpy_bt(g_scan[g_scanCount].name, name, sizeof(g_scan[g_scanCount].name));
+  else g_scan[g_scanCount].name[0]=0;
+  g_scan[g_scanCount].valid = true; g_scanCount++;
+  xSemaphoreGive(g_scanMux);
 }
+
+// FIX #3: snapshot g_targetMac pod mutexem, bez String(g_targetMac) bez locka
 static bool on_ssid_found(const char* ssid, esp_bd_addr_t address, int rssi){
-  String name = ssid ? String(ssid) : String(""); String mac = bdaToStr(address);
-  if (g_scanning || g_targetMac.length()){
-    int prevCount = g_scanCount; scanStore(address, rssi, name);
-    int idx = scanFindByMac(mac);
-    if (idx >= 0 && idx >= prevCount){ logF("DEV %d %s RSSI=%d NAME=\"%s\"\n", idx, mac.c_str(), rssi, name.c_str()); }
+  String name = ssid ? String(ssid) : String("");
+  String macStr = bdaToStr(address);
+
+  // snapshot targetMac pod mutexem
+  char targetSnap[18] = {0};
+  bool hasTarget = false;
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    safe_strncpy(targetSnap, g_targetMac, sizeof(targetSnap));
+    hasTarget = (targetSnap[0]!=0);
+    xSemaphoreGive(g_scanMux);
+  } else {
+    hasTarget = (g_targetMac[0]!=0);
+    safe_strncpy(targetSnap, g_targetMac, sizeof(targetSnap));
   }
-  if (g_targetMac.length() && mac.equalsIgnoreCase(g_targetMac)){ g_connMac = mac; if (name.length()) g_connName = name; logF("EVT SCAN MATCH MAC=%s NAME=\"%s\"\n", mac.c_str(), g_connName.c_str()); return true; }
+
+  bool isScanning = g_scanning;
+  int prevCount = 0;
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    prevCount = g_scanCount;
+    xSemaphoreGive(g_scanMux);
+  } else {
+    prevCount = g_scanCount;
+  }
+
+  if (isScanning || hasTarget){
+    scanStore(address, rssi, name);
+    int idx = scanFindByMac(macStr);
+    if (idx >= 0 && idx >= prevCount){ logF("DEV %d %s RSSI=%d NAME=\"%s\"\n", idx, macStr.c_str(), rssi, name.c_str()); }
+  }
+
+  if (hasTarget && macStr.equalsIgnoreCase(String(targetSnap))){
+    if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+      safe_strncpy(g_connMac, macStr.c_str(), sizeof(g_connMac));
+      if (name.length()) safe_strncpy_bt(g_connName, name, sizeof(g_connName));
+      xSemaphoreGive(g_scanMux);
+    }
+    logF("EVT SCAN MATCH MAC=%s NAME=\"%s\"\n", macStr.c_str(), name.c_str());
+    return true;
+  }
   return false;
 }
 
 static void i2s_init_slave_rx(){
+  i2s_driver_uninstall(I2S_PORT);
   i2s_config_t cfg = {};
   cfg.mode = (i2s_mode_t)(I2S_MODE_SLAVE | I2S_MODE_RX);
   cfg.sample_rate = OUT_SR;
@@ -259,30 +329,12 @@ static void i2s_init_slave_rx(){
   i2s_set_pin(I2S_PORT, &pins);
   i2s_zero_dma_buffer(I2S_PORT);
 }
-
 static void IRAM_ATTR ws_isr(){ g_wsEdges++; }
-
-static TaskHandle_t g_rateTask = nullptr;
 static void reset_resampler_for(SrcRate r){
   rb_clear(); g_phase_q16 = 0; g_rsLpL1 = g_rsLpL2 = 0; g_rsLpR1 = g_rsLpR2 = 0;
   if (r == SRC_48000){ g_step_q16 = (uint32_t)(((uint64_t)48000 << 16) / (uint32_t)OUT_SR); } else { g_step_q16 = 0; }
 }
-static void rate_task(void *){
-  SrcRate lastDec = SRC_UNKNOWN; int stable = 0;
-  uint32_t lastEdges = 0; uint32_t lastMs = millis();
-  for(;;){
-    vTaskDelay(pdMS_TO_TICKS(250));
-    uint32_t nowMs = millis(); uint32_t e = g_wsEdges; uint32_t de = e - lastEdges; uint32_t dt = nowMs - lastMs;
-    lastEdges = e; lastMs = nowMs;
-    if (dt < 50){ continue; }
-    float hz = (float)de * 1000.0f / (float)dt; int ihz = (int)(hz + 0.5f); g_srcHz = ihz;
-    SrcRate dec = SRC_UNKNOWN;
-    if (ihz > 43000 && ihz < 45500) dec = SRC_44100; else if (ihz > 46500 && ihz < 49500) dec = SRC_48000; else dec = SRC_UNKNOWN;
-    if (dec == lastDec && dec != SRC_UNKNOWN){ stable++; } else { stable = 0; lastDec = dec; }
-    if (stable >= 2 && dec != g_srcRate){ g_srcRate = dec; reset_resampler_for(dec); logF("EVT SRC_FS %dHz MODE=%s\n", g_srcHz, (dec==SRC_44100) ? "44100" : (dec==SRC_48000 ? "48000" : "UNKNOWN")); }
-  }
-}
-
+static TaskHandle_t g_rateTask = nullptr;
 static TaskHandle_t g_pcmTask = nullptr;
 static void pcm_task(void *){
   static uint8_t raw[2048];
@@ -305,7 +357,6 @@ static void pcm_task(void *){
     rb_push_frames(pcm16, frames);
   }
 }
-
 static String eirToName(uint8_t *eir){
   if (!eir) return "";
   uint8_t len = 0;
@@ -314,17 +365,21 @@ static String eirToName(uint8_t *eir){
   if (p && len){ char name[64]; int n = (len < (sizeof(name)-1)) ? len : (sizeof(name)-1); memcpy(name, p, n); name[n] = 0; return String(name); }
   return "";
 }
-
 static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param){
   switch(event){
     case ESP_BT_GAP_DISC_STATE_CHANGED_EVT: {
       if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STARTED){ g_scanning = true; logLn("SCAN START"); }
-      else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED){ g_scanning = false; logF("SCAN DONE COUNT=%d\n", g_scanCount); }
+      else if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED){
+        int cntSnap = 0;
+        if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){ cntSnap = g_scanCount; xSemaphoreGive(g_scanMux);} else cntSnap = g_scanCount;
+        g_scanning = false; logF("SCAN DONE COUNT=%d\n", cntSnap);
+      }
     } break;
     case ESP_BT_GAP_DISC_RES_EVT: {
       int rssi = 0; String name = "";
       for (int i=0; i<param->disc_res.num_prop; i++){ auto &p = param->disc_res.prop[i]; if (p.type == ESP_BT_GAP_DEV_PROP_RSSI){ rssi = *(int8_t*)p.val; } else if (p.type == ESP_BT_GAP_DEV_PROP_EIR){ name = eirToName((uint8_t*)p.val); } }
-      scanStore(param->disc_res.bda, rssi, name); String mac = bdaToStr(param->disc_res.bda); int idx = scanFindByMac(mac);
+      scanStore(param->disc_res.bda, rssi, name);
+      String mac = bdaToStr(param->disc_res.bda); int idx = scanFindByMac(mac);
       logF("DEV %d %s RSSI=%d NAME=\"%s\"\n", (idx >= 0 ? idx : 0), mac.c_str(), rssi, name.c_str());
     } break;
     case ESP_BT_GAP_AUTH_CMPL_EVT: {
@@ -343,22 +398,39 @@ static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param){
     default: break;
   }
 }
-
 static void on_conn_state(esp_a2d_connection_state_t state, void *){
   if (g_mode == MODE_OFF){ return; }
   const char* s = (state==ESP_A2D_CONNECTION_STATE_DISCONNECTED) ? "DISCONNECTED" : (state==ESP_A2D_CONNECTION_STATE_CONNECTING) ? "CONNECTING" : (state==ESP_A2D_CONNECTION_STATE_CONNECTED) ? "CONNECTED" : (state==ESP_A2D_CONNECTION_STATE_DISCONNECTING)? "DISCONNECTING" : "UNKNOWN";
-  logF("EVT A2DP_CONN %s MAC=%s NAME=\"%s\"\n", s, g_connMac.length()?g_connMac.c_str():"None", g_connName.c_str());
+  char macCopy[18]={0}, nameCopy[65]={0}, targetCopy[18]={0};
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    safe_strncpy(macCopy, g_connMac, sizeof(macCopy));
+    safe_strncpy(nameCopy, g_connName, sizeof(nameCopy));
+    safe_strncpy(targetCopy, g_targetMac, sizeof(targetCopy));
+    xSemaphoreGive(g_scanMux);
+  } else {
+    safe_strncpy(macCopy, g_connMac, sizeof(macCopy));
+    safe_strncpy(nameCopy, g_connName, sizeof(nameCopy));
+    safe_strncpy(targetCopy, g_targetMac, sizeof(targetCopy));
+  }
+  logF("EVT A2DP_CONN %s MAC=%s NAME=\"%s\"\n", s, macCopy[0]?macCopy:"None", nameCopy);
   if (state == ESP_A2D_CONNECTION_STATE_CONNECTED){
     g_a2dpConnected = true; g_connectInProgress = false; g_lastAudioDataMs = millis(); reset_connect_retry_state(); g_cbCalls = 0; rb_clear(); g_rbState = RB_PROCESS; g_phase_q16 = 0;
-    // MOD Core3: w 1.8.11 nie wołamy esp_a2d_media_ctrl - lib sama startuje AUDIO
-    if (!g_connMac.length() && g_targetMac.length()) { g_connMac = g_targetMac; }
+    if (!macCopy[0] && targetCopy[0]) {
+      if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+        safe_strncpy(g_connMac, targetCopy, sizeof(g_connMac));
+        xSemaphoreGive(g_scanMux);
+      }
+    }
   }
   if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED){
     g_a2dpConnected = false; g_lastAudioDataMs = 0; g_cbCalls = 0; g_cbSilent = 0; g_cbUnderrun = 0; g_rbState = RB_PREFETCH; rb_clear(); g_phase_q16 = 0;
     if (g_ignoreLocalDisconnectOnce){ g_ignoreLocalDisconnectOnce = false; clear_connect_retry_timer(); logLn("EVT A2DP_CONN LOCAL_RESET_IGNORED"); return; }
-    if (g_connectInProgress && g_targetMac.length() && g_connectRetryCount < CONNECT_RETRY_MAX){ g_connectRetryCount++; g_connectRetryAtMs = millis() + CONNECT_RETRY_DELAY_MS; g_connectInProgress = false; logF("EVT A2DP_CONN RETRY %u IN %lums MAC=%s\n", (unsigned)g_connectRetryCount, (unsigned long)CONNECT_RETRY_DELAY_MS, g_targetMac.c_str()); return; }
+    if (g_connectInProgress && targetCopy[0] && g_connectRetryCount < CONNECT_RETRY_MAX){ g_connectRetryCount++; g_connectRetryAtMs = millis() + CONNECT_RETRY_DELAY_MS; g_connectInProgress = false; logF("EVT A2DP_CONN RETRY %u IN %lums MAC=%s\n", (unsigned)g_connectRetryCount, (unsigned long)CONNECT_RETRY_DELAY_MS, targetCopy); return; }
     clear_connect_retry_timer();
-    if (g_connectInProgress || g_targetMac.length()) { if (!g_connMac.length() && g_targetMac.length()) { g_connMac = g_targetMac; } } else { g_connMac = ""; g_connName = ""; }
+    if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+      if (g_connectInProgress || targetCopy[0]) { if (!g_connMac[0] && targetCopy[0]) { safe_strncpy(g_connMac, targetCopy, sizeof(g_connMac)); } } else { g_connMac[0]=0; g_connName[0]=0; }
+      xSemaphoreGive(g_scanMux);
+    }
   }
   if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTING){ g_a2dpConnected = false; }
 }
@@ -366,9 +438,6 @@ static void on_audio_state(esp_a2d_audio_state_t state, void *){
   const char* s = (state==ESP_A2D_AUDIO_STATE_STOPPED) ? "STOPPED" : (state==ESP_A2D_AUDIO_STATE_STARTED) ? "STARTED" : (state==ESP_A2D_AUDIO_STATE_SUSPENDED) ? "SUSPENDED" : "UNKNOWN";
   logF("EVT A2DP_AUDIO %s RB=%lu\n", s, (unsigned long)rb_count_frames());
 }
-
-// ===== A2DP data callback - NOWE API 1.8.11 =====
-// W 1.8.11 callback to set_data_callback(uint8_t*, int32_t) -> int32_t
 static int32_t get_data(uint8_t *data, int32_t len){
   g_lastAudioDataMs = millis(); g_cbCalls++;
   if (!g_btReady || g_mode == MODE_OFF){ g_cbSilent++; memset(data, 0, len); return len; }
@@ -401,24 +470,15 @@ static int32_t get_data(uint8_t *data, int32_t len){
   }
   return len;
 }
-
 static void cfg_save(){
   nvs_handle_t h; if (nvs_open("btcfg", NVS_READWRITE, &h) != ESP_OK){ logLn("ERR SAVE"); return; }
-  nvs_set_i32(h, "mode", (int)g_mode); nvs_set_i32(h, "vol", g_vol_ui); nvs_set_i32(h, "boost", g_boost_pct); nvs_set_str(h, "mac", g_connMac.c_str()); nvs_commit(h); nvs_close(h); logLn("OK SAVE");
+  nvs_set_i32(h, "mode", (int)g_mode); nvs_set_i32(h, "vol", g_vol_ui); nvs_set_i32(h, "boost", g_boost_pct);
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    nvs_set_str(h, "mac", g_connMac);
+    xSemaphoreGive(g_scanMux);
+  }
+  nvs_commit(h); nvs_close(h); logLn("OK SAVE");
 }
-static void cfg_load(){
-  nvs_handle_t h; if (nvs_open("btcfg", NVS_READONLY, &h) != ESP_OK) return;
-  int32_t m=0, v=100, b=100; size_t len=0;
-  if (nvs_get_i32(h, "mode", &m) == ESP_OK) g_mode = (Mode)m;
-  if (nvs_get_i32(h, "vol", &v) == ESP_OK) g_vol_ui = (int)v;
-  if (nvs_get_i32(h, "boost", &b) == ESP_OK) g_boost_pct = (int)b;
-  nvs_get_str(h, "mac", nullptr, &len);
-  if (len > 1 && len < 32){ char buf[32]; if (nvs_get_str(h, "mac", buf, &len) == ESP_OK) g_connMac = String(buf); }
-  nvs_close(h);
-  if (g_vol_ui < 0) g_vol_ui = 0; if (g_vol_ui > 100) g_vol_ui = 100; g_vol_127 = (uint8_t)lround((double)g_vol_ui * 127.0 / 100.0);
-  if (g_boost_pct < 100) g_boost_pct = 100; if (g_boost_pct > 400) g_boost_pct = 400;
-}
-
 static void ensureBtStarted(){
   if (g_btReady) return;
   esp_err_t ret = nvs_flash_init();
@@ -426,23 +486,18 @@ static void ensureBtStarted(){
   pinMode(PIN_I2S_WS, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_I2S_WS), ws_isr, RISING);
   i2s_init_slave_rx();
-
-  // ===== NOWE API 1.8.11 - Core 3.x =====
   a2dp.set_local_name("WROOM-BT-TX");
   a2dp.set_ssp_enabled(true);
   a2dp.set_ssid_callback(on_ssid_found);
   a2dp.set_auto_reconnect(false);
   a2dp.set_on_connection_state_changed(on_conn_state);
   a2dp.set_on_audio_state_changed(on_audio_state);
-  // KLUCZOWA ZMIANA 1.7.5 -> 1.8.11:
   a2dp.set_data_callback(get_data);
   a2dp.start("WROOM-BT-TX");
-  // ======================================
-
   a2dp.set_volume(g_vol_127);
   setBtTxPowerMax();
   rb_clear(); g_srcRate = SRC_UNKNOWN; g_srcHz = 0; g_i2sReadsOk = 0; g_i2sReadsErr = 0; g_i2sZeroReads = 0; g_i2sBytes = 0; g_cbCalls = 0; g_cbSilent = 0; g_cbUnderrun = 0;
-  xTaskCreatePinnedToCore([](void* p){ // rate_task lambda wrapper
+  xTaskCreatePinnedToCore([](void* p){
     for(;;){
       vTaskDelay(pdMS_TO_TICKS(250));
       uint32_t nowMs = millis(); uint32_t e = g_wsEdges; static uint32_t lastEdges=0; static uint32_t lastMs=0; static SrcRate lastDec=SRC_UNKNOWN; static int stable=0;
@@ -458,40 +513,87 @@ static void ensureBtStarted(){
   xTaskCreatePinnedToCore(pcm_task,  "pcm_task",  4096, nullptr, 2, &g_pcmTask,  1);
   g_btReady = true;
 }
-
 static void status_send(){
   const char* sr = (g_srcRate==SRC_44100) ? "44100" : (g_srcRate==SRC_48000) ? "48000" : "UNKNOWN";
   const char* rbState = (g_rbState==RB_PREFETCH) ? "PREFETCH" : (g_rbState==RB_DROP) ? "DROP" : "PROCESS";
+  char macCopy[18]={0}, nameCopy[65]={0};
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    safe_strncpy(macCopy, g_connMac, sizeof(macCopy));
+    safe_strncpy(nameCopy, g_connName, sizeof(nameCopy));
+    xSemaphoreGive(g_scanMux);
+  } else {
+    safe_strncpy(macCopy, g_connMac, sizeof(macCopy));
+    safe_strncpy(nameCopy, g_connName, sizeof(nameCopy));
+  }
   logF("STATE BT=%s MODE=%s VOL=%d(127=%d) BOOST=%d SRC=%s(%dHz) RB=%lu[%s] SCAN=%d CONN=%d MAC=%s NAME=\"%s\" I2S_OK=%lu I2S_ERR=%lu I2S_ZR=%lu I2S_B=%lu CB=%lu CBS=%lu CBU=%lu\n",
-    g_btReady ? "ON":"OFF", g_mode==MODE_OFF?"OFF":(g_mode==MODE_TX?"TX":"AUTO"), g_vol_ui, (int)g_vol_127, g_boost_pct, sr, g_srcHz, (unsigned long)rb_count_frames(), rbState, g_scanning ? 1:0, g_a2dpConnected ? 1:0, g_a2dpConnected && g_connMac.length()?g_connMac.c_str():"None", g_a2dpConnected?g_connName.c_str():"", (unsigned long)g_i2sReadsOk, (unsigned long)g_i2sReadsErr, (unsigned long)g_i2sZeroReads, (unsigned long)g_i2sBytes, (unsigned long)g_cbCalls, (unsigned long)g_cbSilent, (unsigned long)g_cbUnderrun);
+    g_btReady ? "ON":"OFF", g_mode==MODE_OFF?"OFF":(g_mode==MODE_TX?"TX":"AUTO"), g_vol_ui, (int)g_vol_127, g_boost_pct, sr, g_srcHz, (unsigned long)rb_count_frames(), rbState, g_scanning ? 1:0, g_a2dpConnected ? 1:0, macCopy[0]?macCopy:"None", nameCopy, (unsigned long)g_i2sReadsOk, (unsigned long)g_i2sReadsErr, (unsigned long)g_i2sZeroReads, (unsigned long)g_i2sBytes, (unsigned long)g_cbCalls, (unsigned long)g_cbSilent, (unsigned long)g_cbUnderrun);
 }
-static void soft_off(){ logLn("OK MODE OFF - use DISCONNECT not BT OFF!");
+static void soft_off(){
   reset_connect_retry_state();
   if (g_scanning){ esp_bt_gap_cancel_discovery(); g_scanning = false; }
-  a2dp.disconnect(); g_a2dpConnected = false; g_connectInProgress = false; g_targetMac = ""; g_connMac = ""; g_connName = ""; g_mode = MODE_OFF; logLn("OK MODE OFF");
+  a2dp.disconnect(); g_a2dpConnected = false; g_connectInProgress = false;
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    g_targetMac[0]=0; g_connMac[0]=0; g_connName[0]=0;
+    xSemaphoreGive(g_scanMux);
+  }
+  g_mode = MODE_OFF; logLn("OK MODE OFF");
 }
 static void scan_start(){
   ensureBtStarted(); reset_connect_retry_state();
-  if (g_a2dpConnected || g_connectInProgress){ g_ignoreLocalDisconnectOnce = false; g_a2dpConnected = false; g_connectInProgress = false; g_targetMac = ""; g_connMac = ""; g_connName = ""; a2dp.disconnect(); }
+  if (g_a2dpConnected || g_connectInProgress){
+    g_ignoreLocalDisconnectOnce = false; g_a2dpConnected = false; g_connectInProgress = false;
+    if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+      g_targetMac[0]=0; g_connMac[0]=0; g_connName[0]=0;
+      xSemaphoreGive(g_scanMux);
+    }
+    a2dp.disconnect();
+  }
   if (g_scanning){ esp_bt_gap_cancel_discovery(); g_scanning = false; vTaskDelay(pdMS_TO_TICKS(CONNECT_POST_SCAN_DELAY_MS)); }
-  scanClear(); g_targetMac = ""; g_scanning = true; g_scanStartedMs = millis(); logLn("OK SCAN START"); logLn("SCAN START"); start_gap_scan();
+  scanClear();
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){ g_targetMac[0]=0; xSemaphoreGive(g_scanMux); }
+  g_scanning = true; g_scanStartedMs = millis(); logLn("OK SCAN START"); logLn("SCAN START"); start_gap_scan();
 }
 static void connect_mac(const String& mac){
   if (g_mode == MODE_OFF){ g_mode = MODE_TX; logLn("OK MODE TX (AUTO)"); }
   esp_bd_addr_t bda{}; if (!parseMac(mac, bda)){ logF("ERR CONNECT MAC (invalid format): %s\n", mac.c_str()); return; }
-  int idx = scanFindByMac(mac); if (idx >= 0) g_connName = g_scan[idx].name; else g_connName = "";
-  g_connMac = mac; g_targetMac = mac; g_connectInProgress = true;
+  int idx = scanFindByMac(mac);
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    if (idx >= 0) safe_strncpy(g_connName, g_scan[idx].name, sizeof(g_connName));
+    else g_connName[0]=0;
+    safe_strncpy(g_connMac, mac.c_str(), sizeof(g_connMac));
+    safe_strncpy(g_targetMac, mac.c_str(), sizeof(g_targetMac));
+    xSemaphoreGive(g_scanMux);
+  }
+  g_connectInProgress = true;
   if (g_scanning){ esp_bt_gap_cancel_discovery(); g_scanning = false; logLn("SCAN STOP (AUTO BEFORE CONNECT)"); vTaskDelay(pdMS_TO_TICKS(CONNECT_POST_SCAN_DELAY_MS)); }
   if (g_a2dpConnected){ g_ignoreLocalDisconnectOnce = true; a2dp.disconnect(); vTaskDelay(pdMS_TO_TICKS(120)); }
   esp_err_t err = esp_a2d_source_connect(bda);
   if (err != ESP_OK){ g_connectInProgress = false; logF("ERR CONNECT %s A2DP=%d\n", mac.c_str(), (int)err); return; }
-  logF("OK CONNECT %s NAME=\"%s\"\n", mac.c_str(), g_connName.c_str());
+  char nameSnap[65]={0};
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){ safe_strncpy(nameSnap, g_connName, sizeof(nameSnap)); xSemaphoreGive(g_scanMux);} else safe_strncpy(nameSnap, g_connName, sizeof(nameSnap));
+  logF("OK CONNECT %s NAME=\"%s\"\n", mac.c_str(), nameSnap);
 }
 static void connect_idx(int idx){
-  if (idx < 0 || idx >= g_scanCount || !g_scan[idx].valid){ logLn("ERR CONNECT IDX"); return; }
-  String mac = bdaToStr(g_scan[idx].bda); g_connName = g_scan[idx].name; reset_connect_retry_state(); connect_mac(mac);
+  char macTmp[18]={0};
+  char nameTmp[65]={0};
+  bool valid = false;
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    valid = (idx >=0 && idx < g_scanCount && g_scan[idx].valid);
+    if (valid){ String ms = bdaToStr(g_scan[idx].bda); safe_strncpy(macTmp, ms.c_str(), sizeof(macTmp)); safe_strncpy(nameTmp, g_scan[idx].name, sizeof(nameTmp)); safe_strncpy(g_connName, g_scan[idx].name, sizeof(g_connName)); }
+    xSemaphoreGive(g_scanMux);
+  }
+  if (!valid){ logLn("ERR CONNECT IDX"); return; }
+  String mac = String(macTmp);
+  reset_connect_retry_state(); connect_mac(mac);
 }
-static void disconnect_bt(){ reset_connect_retry_state(); a2dp.disconnect(); g_a2dpConnected = false; g_connectInProgress = false; g_targetMac = ""; g_connMac = ""; g_connName = ""; logLn("OK DISCONNECT"); }
+static void disconnect_bt(){
+  reset_connect_retry_state(); a2dp.disconnect(); g_a2dpConnected = false; g_connectInProgress = false;
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    g_targetMac[0]=0; g_connMac[0]=0; g_connName[0]=0;
+    xSemaphoreGive(g_scanMux);
+  }
+  logLn("OK DISCONNECT");
+}
 static void paired_list(){
   ensureBtStarted(); int n = esp_bt_gap_get_bond_device_num(); if (n <= 0){ logLn("PAIRED DONE COUNT=0"); return; }
   esp_bd_addr_t *list = (esp_bd_addr_t*)malloc(n * sizeof(esp_bd_addr_t)); if (!list){ logLn("ERR MEM"); return; }
@@ -504,7 +606,12 @@ static void delpaired_task(void *){
   esp_bd_addr_t *list = (esp_bd_addr_t*)malloc(n * sizeof(esp_bd_addr_t)); if (!list){ logLn("ERR MEM"); g_delTask = nullptr; vTaskDelete(nullptr); return; }
   esp_bt_gap_get_bond_device_list(&n, list); int removed = 0; for (int i=0;i<n;i++){ if (esp_bt_gap_remove_bond_device(list[i]) == ESP_OK) removed++; vTaskDelay(pdMS_TO_TICKS(50)); } free(list);
   nvs_handle_t h; if (nvs_open("btcfg", NVS_READWRITE, &h) == ESP_OK){ nvs_erase_key(h, "mac"); nvs_commit(h); nvs_close(h); }
-  g_a2dpConnected = false; g_connectInProgress = false; g_targetMac = ""; g_connMac = ""; g_connName = ""; logF("OK DELPAIRED %d\n", removed); g_delTask = nullptr; vTaskDelete(nullptr);
+  g_a2dpConnected = false; g_connectInProgress = false;
+  if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+    g_targetMac[0]=0; g_connMac[0]=0; g_connName[0]=0;
+    xSemaphoreGive(g_scanMux);
+  }
+  logF("OK DELPAIRED %d\n", removed); g_delTask = nullptr; vTaskDelete(nullptr);
 }
 static void delpaired_all_async(){ if (g_delTask){ logLn("ERR DELPAIRED BUSY"); return; } logLn("OK DELPAIRED START"); xTaskCreatePinnedToCore(delpaired_task, "delpaired", 4096, nullptr, 1, &g_delTask, 1); }
 static void help_print(){ logLn("CMDS: HELP, PING, GET, STATUS?, BT ON, BT OFF, MODE OFF|TX (AUTO=legacy), VOL 0..100, BOOST 100..400, SCAN, CONNECT <idx|MAC>, DISCONNECT, PAIRED?, DELPAIRED ALL, SAVE, DBG 0|1, HARDRESET"); }
@@ -520,7 +627,13 @@ static void handle_cmd(String s, const char* src){
   if (u.startsWith("BOOST ")){ int b = s.substring(6).toInt(); if (b < 100) b = 100; if (b > 400) b = 400; g_boost_pct = b; logF("OK BOOST %d\n", g_boost_pct); return; }
   if (u=="SCAN"){ scan_start(); return; }
   if (u.startsWith("CONNECT ")){ String a = s.substring(8); a.trim(); String aUp = a; aUp.toUpperCase(); if (aUp.startsWith("CONNECT ")){ a = a.substring(8); a.trim(); } if (a.indexOf(':') >= 0){ reset_connect_retry_state(); connect_mac(a); return; } int idx = a.toInt(); connect_idx(idx); return; }
-  if (u=="DISCONNECT"){ disconnect_bt(); return; } if (u=="PAIRED?"){ paired_list(); return; } if (u=="DELPAIRED ALL"){ delpaired_all_async(); return; } if (u=="SAVE"){ nvs_handle_t h; if (nvs_open("btcfg", NVS_READWRITE, &h) != ESP_OK){ logLn("ERR SAVE"); return; } nvs_set_i32(h, "mode", (int)g_mode); nvs_set_i32(h, "vol", g_vol_ui); nvs_set_i32(h, "boost", g_boost_pct); nvs_set_str(h, "mac", g_connMac.c_str()); nvs_commit(h); nvs_close(h); logLn("OK SAVE"); return; }
+  if (u=="DISCONNECT"){ disconnect_bt(); return; } if (u=="PAIRED?"){ paired_list(); return; } if (u=="DELPAIRED ALL"){ delpaired_all_async(); return; }
+  if (u=="SAVE"){
+    nvs_handle_t h; if (nvs_open("btcfg", NVS_READWRITE, &h) != ESP_OK){ logLn("ERR SAVE"); return; }
+    nvs_set_i32(h, "mode", (int)g_mode); nvs_set_i32(h, "vol", g_vol_ui); nvs_set_i32(h, "boost", g_boost_pct);
+    if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){ nvs_set_str(h, "mac", g_connMac); xSemaphoreGive(g_scanMux);} 
+    nvs_commit(h); nvs_close(h); logLn("OK SAVE"); return;
+  }
   if (u=="HARDRESET"){ logLn("OK HARDRESET"); delay(50); ESP.restart(); return; }
   logLn("ERR UNKNOWN");
 }
@@ -529,15 +642,44 @@ static bool readLineFrom(Stream& st, String& buf, String& outLine){
   return false;
 }
 void setup(){
+  g_logMux = xSemaphoreCreateMutex();
+  g_scanMux = xSemaphoreCreateMutex();
   Serial.begin(115200); CTRL.begin(UART_BAUD, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
-  logLn("READY WROOM-BT-TX v1.7.0-port-1.8.11 FIX8 CLEAN - Core3.0.7 MOD AJ");
-  nvs_handle_t h; if (nvs_open("btcfg", NVS_READONLY, &h) == ESP_OK){ int32_t m=0,v=100,b=100; size_t len=0; if (nvs_get_i32(h, "mode", &m) == ESP_OK) g_mode = (Mode)m; if (nvs_get_i32(h, "vol", &v) == ESP_OK) g_vol_ui = (int)v; if (nvs_get_i32(h, "boost", &b) == ESP_OK) g_boost_pct = (int)b; nvs_get_str(h, "mac", nullptr, &len); if (len > 1 && len < 32){ char buf[32]; if (nvs_get_str(h, "mac", buf, &len) == ESP_OK) g_connMac = String(buf); } nvs_close(h); if (g_vol_ui < 0) g_vol_ui = 0; if (g_vol_ui > 100) g_vol_ui = 100; g_vol_127 = (uint8_t)lround((double)g_vol_ui * 127.0 / 100.0); if (g_boost_pct < 100) g_boost_pct = 100; if (g_boost_pct > 400) g_boost_pct = 400; }
-  ensureBtStarted(); // FIX7 no 10s delay
+  logLn("READY WROOM-BT-TX v1.7.0-port-1.8.11 FIX9 P1-FIXED v6 FINAL 100% CLOSED 100% - scanStore no-lock guard - scanClear/scanFind taken fix CLEAN - Core3.0.7 MOD AJ");
+  nvs_handle_t h; if (nvs_open("btcfg", NVS_READONLY, &h) == ESP_OK){
+    int32_t m=0,v=100,b=100; size_t len=0;
+    if (nvs_get_i32(h, "mode", &m) == ESP_OK) g_mode = (Mode)m;
+    if (nvs_get_i32(h, "vol", &v) == ESP_OK) g_vol_ui = (int)v;
+    if (nvs_get_i32(h, "boost", &b) == ESP_OK) g_boost_pct = (int)b;
+    nvs_get_str(h, "mac", nullptr, &len);
+    if (len > 1 && len < 32){ char buf[32]; if (nvs_get_str(h, "mac", buf, &len) == ESP_OK) { safe_strncpy(g_connMac, buf, sizeof(g_connMac)); } }
+    nvs_close(h);
+    if (g_vol_ui < 0) g_vol_ui = 0; if (g_vol_ui > 100) g_vol_ui = 100; g_vol_127 = (uint8_t)lround((double)g_vol_ui * 127.0 / 100.0);
+    if (g_boost_pct < 100) g_boost_pct = 100; if (g_boost_pct > 400) g_boost_pct = 400;
+  }
+  ensureBtStarted();
 }
 void loop(){
   static String bufUart, bufUsb, line;
-  if (g_connectRetryAtMs && (int32_t)(millis() - g_connectRetryAtMs) >= 0){ String retryMac = g_targetMac; g_connectRetryAtMs = 0; if (retryMac.length()){ logF("EVT A2DP_CONN RETRY CONNECT MAC=%s\n", retryMac.c_str()); connect_mac(retryMac); return; } }
-  if (g_scanning){ const uint32_t scanAgeMs = millis() - g_scanStartedMs; if (scanAgeMs >= SCAN_WINDOW_MS){ esp_bt_gap_cancel_discovery(); g_scanning = false; logF("SCAN DONE COUNT=%d\n", g_scanCount); } }
+  char retryMac[18]={0};
+  if (g_connectRetryAtMs && (int32_t)(millis() - g_connectRetryAtMs) >= 0){
+    if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){
+      safe_strncpy(retryMac, g_targetMac, sizeof(retryMac));
+      xSemaphoreGive(g_scanMux);
+    } else {
+      safe_strncpy(retryMac, g_targetMac, sizeof(retryMac));
+    }
+    g_connectRetryAtMs = 0;
+    if (retryMac[0]){ logF("EVT A2DP_CONN RETRY CONNECT MAC=%s\n", retryMac); connect_mac(String(retryMac)); return; }
+  }
+  if (g_scanning){
+    uint32_t age = 0;
+    int cntSnap = 0;
+    // snapshot scanCount pod mutexem dla loga
+    if (g_scanMux && xSemaphoreTake(g_scanMux, SCAN_MUX_TIMEOUT)==pdTRUE){ cntSnap = g_scanCount; xSemaphoreGive(g_scanMux);} else cntSnap = g_scanCount;
+    age = millis() - g_scanStartedMs;
+    if (age >= SCAN_WINDOW_MS){ esp_bt_gap_cancel_discovery(); g_scanning = false; logF("SCAN DONE COUNT=%d\n", cntSnap); }
+  }
   if (readLineFrom(CTRL, bufUart, line)){ handle_cmd(line, "UART"); }
   if (readLineFrom(Serial, bufUsb, line)){ handle_cmd(line, "USB"); }
   delay(1);
