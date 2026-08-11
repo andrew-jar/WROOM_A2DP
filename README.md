@@ -18,15 +18,23 @@ Współpracuje z: https://github.com/andrew-jar/VTomRadio_BT
 
 <img width="650" height="405" alt="2026-07-21_174244" src="https://github.com/user-attachments/assets/bcaa48a4-4db7-4c65-9e27-35e031aa70bd" />
 
+-----------------------------------------------------
+### Wskazówki montażowe i praktyczne uwagi
+
+1.Rezystory powinny być umieszczone możliwie najbliżej układu WROOM, aby zminimalizować długość ścieżek sygnałowych i poprawić stabilność pracy układu.
+
+2.Długość przewodów linii I2S powinna być ograniczona do maksymalnie 10 cm. Dłuższe połączenia mogą powodować zakłócenia i pogorszenie jakości transmisji.
+
+3.W obwodzie zasilania 3.3 V warto dodać kondensator 470 µF, który pomaga stabilizować napięcie i poprawia odporność układu na skoki prądowe.
+
+4.Przy montażu zaleca się stosowanie krótkich, możliwie jak najprostszych połączeń ekranowanych oraz staranne oddzielenie linii zasilania od linii sygnałowych.
+
+----------------------------------------------------
 
 WROOM-BT-TX Dokumentacja Techniczna (PL)
 
 Autor: A. Jaroszuk
 1. Zakres
-
-Ten dokument opisuje firmware:
-
-    WROOM_A2DP.ino
 
 Plytka docelowa:
 
