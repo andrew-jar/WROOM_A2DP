@@ -21,13 +21,13 @@ Współpracuje z: https://github.com/andrew-jar/VTomRadio_BT
 -----------------------------------------------------
 ### Wskazówki montażowe i praktyczne uwagi
 
-1.Rezystory powinny być umieszczone możliwie najbliżej układu WROOM, aby zminimalizować długość ścieżek sygnałowych i poprawić stabilność pracy układu.
+1. Rezystory powinny być umieszczone możliwie najbliżej układu WROOM, aby zminimalizować długość ścieżek sygnałowych i poprawić stabilność pracy układu.
 
-2.Długość przewodów linii I2S powinna być ograniczona do maksymalnie 10 cm. Dłuższe połączenia mogą powodować zakłócenia i pogorszenie jakości transmisji.
+2. Długość przewodów (ekranowanych) linii I2S powinna być ograniczona do maksymalnie 10 cm. Dłuższe połączenia mogą powodować zakłócenia i pogorszenie jakości transmisji.
 
-3.W obwodzie zasilania 3.3 V warto dodać kondensator 470 µF, który pomaga stabilizować napięcie i poprawia odporność układu na skoki prądowe.
+3. W obwodzie zasilania 3.3 V warto dodać kondensator 470 µF, który pomaga stabilizować napięcie i poprawia odporność układu na skoki prądowe.
 
-4.Przy montażu zaleca się stosowanie krótkich, możliwie jak najprostszych połączeń ekranowanych oraz staranne oddzielenie linii zasilania od linii sygnałowych.
+4. Przy montażu zaleca się stosowanie krótkich połączeń oraz staranne oddzielenie linii zasilania od linii sygnałowych.
 
 ----------------------------------------------------
 
